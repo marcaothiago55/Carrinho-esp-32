@@ -1,0 +1,173 @@
+#include <WebServer.h>
+#include <WebSocketsServer.h> 
+#include <Adafruit_NeoPixel.h>
+
+const char* ssid = "FutureBots_MiniEstrela";
+const char* password = "12345678";
+
+// ================== LIGAÇÃO NA PONTE H ==================
+/*
+Você vai usar uma ponte H (ex: L298N ou L293D)
+
+MOTOR ESQUERDO:
+motorEsquerdoFrente (pino 12)  -> IN1 da ponte H
+motorEsquerdoTras   (pino 13)  -> IN2 da ponte H
+
+MOTOR DIREITO:
+motorDireitoFrente  (pino 14)  -> IN3 da ponte H
+motorDireitoTras    (pino 27)  -> IN4 da ponte H
+
+OUTRAS LIGAÇÕES IMPORTANTES:
+
+PONTE H -> MOTORES:
+OUT1 e OUT2 -> Motor esquerdo
+OUT3 e OUT4 -> Motor direito
+
+ALIMENTAÇÃO:
+12V (ou bateria) -> VCC da ponte H (alimentação dos motores)
+GND da bateria -> GND da ponte H
+GND da ponte H -> GND do ESP32 (OBRIGATÓRIO)
+
+ENABLE (se for L298N):
+ENA -> pode ligar direto no 5V ou usar PWM
+ENB -> pode ligar direto no 5V ou usar PWM
+
+OBS:
+- Nunca alimente motor direto no ESP32
+- Sempre use bateria externa para motores
+*/
+// =======================================================
+
+// Pinos dos Motores
+const int motorEsquerdoFrente = 12;
+const int motorEsquerdoTras   = 13;
+const int motorDireitoFrente  = 14;
+const int motorDireitoTras    = 27;
+
+// Configuração dos LEDs
+#define LED_PIN    2
+#define NUM_LEDS   6
+Adafruit_NeoPixel leds(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+int corAtual = 0;
+int efeitoAtual = 0;
+bool sistemaLigado = false;
+unsigned long delayLeds = 0;
+
+WebServer server(80);
+WebSocketsServer webSocket = WebSocketsServer(81);
+unsigned long lastSignalTime = 0;
+
+// FUNÇÃO DE FREIO (PARA OS MOTORES)
+void freio() {
+  // Desliga todos os sinais da ponte H (motor para)
+  digitalWrite(motorEsquerdoFrente, LOW);
+  digitalWrite(motorEsquerdoTras, LOW);
+  digitalWrite(motorDireitoFrente, LOW);
+  digitalWrite(motorDireitoTras, LOW);
+}
+
+void atualizarLeds() {
+  if (!sistemaLigado) {
+    leds.clear();
+    leds.show();
+    return;
+  }
+
+  uint32_t cores[] = {
+    leds.Color(255,0,0),   // Vermelho
+    leds.Color(0,255,0),   // Verde
+    leds.Color(0,0,255),   // Azul
+    leds.Color(255,255,255), // Branco
+    leds.Color(255,150,0)  // Amarelo
+  };
+  
+  if (efeitoAtual == 0) { // Estático
+    for(int i=0; i<NUM_LEDS; i++) leds.setPixelColor(i, cores[corAtual]);
+  } 
+  else if (efeitoAtual == 1) { // Piscar
+    if ((millis() / 400) % 2) leds.clear();
+    else for(int i=0; i<NUM_LEDS; i++) leds.setPixelColor(i, cores[corAtual]);
+  }
+  else if (efeitoAtual == 2) { // Correr
+    leds.clear();
+    leds.setPixelColor((millis() / 100) % NUM_LEDS, cores[corAtual]);
+  }
+  else if (efeitoAtual == 3) { // Aleatório
+    if (millis() - delayLeds > 150) {
+      for(int i=0; i<NUM_LEDS; i++) leds.setPixelColor(i, leds.Color(random(255), random(255), random(255)));
+      delayLeds = millis();
+    }
+  }
+  leds.show();
+}
+
+// CONTROLE DOS MOTORES (ATRAVÉS DA PONTE H)
+void controlarMotores(int v, int a) {
+  if (v < 5) { freio(); return; }
+
+  lastSignalTime = millis(); 
+
+  int pwm = map(v, 0, 100, 0, 220);
+  int vE = 0, vD = 0;
+
+  if (a >= 60 && a <= 120) { vE = pwm; vD = pwm; } 
+  else if (a > 120 && a < 240) {
+    if (a > 150 && a < 210) { 
+      // GIRO NO LUGAR
+      vE = -pwm * 0.35; 
+      vD = pwm * 0.35; 
+    } 
+    else { 
+      // CURVA
+      vE = pwm * 0.4; 
+      vD = pwm; 
+    }
+  }
+  else if (a >= 240 && a <= 300) { 
+    // RÉ
+    vE = -pwm; 
+    vD = -pwm; 
+  }
+  else {
+    if (a < 30 || a > 330) { 
+      // GIRO PARA OUTRO LADO
+      vE = pwm * 0.35; 
+      vD = -pwm * 0.35; 
+    } 
+    else { 
+      vE = pwm; 
+      vD = pwm * 0.4; 
+    }
+  }
+
+  // ENVIO PARA PONTE H:
+  // Frente = um pino HIGH / PWM
+  // Ré = pino invertido
+
+  analogWrite(motorEsquerdoFrente, vE > 0 ? vE : 0);
+  analogWrite(motorEsquerdoTras,   vE < 0 ? abs(vE) : 0);
+
+  analogWrite(motorDireitoFrente,  vD > 0 ? vD : 0);
+  analogWrite(motorDireitoTras,    vD < 0 ? abs(vD) : 0);
+}
+
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+  if (type == WStype_TEXT) {
+    char* cmd = (char*)payload;
+
+    if (strcmp(cmd, "TOGGLE") == 0) sistemaLigado = !sistemaLigado;
+    else if (strcmp(cmd, "COR") == 0) {
+      corAtual++; if(corAtual > 4) corAtual = 0;
+    }
+    else if (strcmp(cmd, "EFEITO") == 0) {
+      efeitoAtual++; if(efeitoAtual > 3) efeitoAtual = 0;
+    }
+    else {
+      int v, a;
+      if (sscanf(cmd, "%d,%d", &v, &a) == 2) {
+        controlarMotores(v, a);
+      }
+    }
+  }
+}
